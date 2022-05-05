@@ -41,13 +41,11 @@ ReadHandler::ReadHandler(ManagementCallback & apCallback, Messaging::ExchangeCon
                          InteractionType aInteractionType) :
     mManagementCallback(apCallback)
 {
-    mpExchangeMgr                = apExchangeContext->GetExchangeMgr();
     mpExchangeCtx                = apExchangeContext;
     mInteractionType             = aInteractionType;
-    mInitiatorNodeId             = apExchangeContext->GetSessionHandle()->AsSecureSession()->GetPeerNodeId();
-    mSubjectDescriptor           = apExchangeContext->GetSessionHandle()->GetSubjectDescriptor();
     mLastWrittenEventsBytes      = 0;
     mSubscriptionStartGeneration = InteractionModelEngine::GetInstance()->GetReportingEngine().GetDirtySetGeneration();
+    mFlags.ClearAll();
     if (apExchangeContext != nullptr)
     {
         apExchangeContext->SetDelegate(this);
@@ -84,7 +82,7 @@ void ReadHandler::Abort(bool aCalledFromDestructor)
 ReadHandler::~ReadHandler()
 {
     auto * appCallback = mManagementCallback.GetAppCallback();
-    if (mActiveSubscription && appCallback)
+    if (mFlags.Has(ReadHandlerFlags::ActiveSubscription) && appCallback)
     {
         appCallback->OnSubscriptionTerminated(*this);
     }
@@ -142,7 +140,7 @@ CHIP_ERROR ReadHandler::OnInitialRequest(System::PacketBufferHandle && aPayload)
     else
     {
         // Force us to be in a dirty state so we get processed by the reporting
-        mForceDirty = true;
+        mFlags.Set(ReadHandlerFlags::ForceDirty);
     }
 
     return err;
@@ -169,7 +167,7 @@ CHIP_ERROR ReadHandler::OnStatusResponse(Messaging::ExchangeContext * apExchange
                 mpExchangeCtx = nullptr;
                 SuccessOrExit(err);
 
-                mActiveSubscription = true;
+                mFlags.Set(ReadHandlerFlags::ActiveSubscription);
 
                 auto * appCallback = mManagementCallback.GetAppCallback();
                 if (appCallback)
@@ -221,7 +219,7 @@ CHIP_ERROR ReadHandler::SendStatusReport(Protocols::InteractionModel::Status aSt
     {
         VerifyOrReturnLogError(mpExchangeCtx == nullptr, CHIP_ERROR_INCORRECT_STATE);
         VerifyOrReturnLogError(mSessionHandle, CHIP_ERROR_INCORRECT_STATE);
-        mpExchangeCtx = mpExchangeMgr->NewContext(mSessionHandle.Get(), this);
+        mpExchangeCtx = InteractionModelEngine::GetInstance()->GetExchangeManager()->NewContext(mSessionHandle.Get(), this);
     }
     VerifyOrReturnLogError(mpExchangeCtx != nullptr, CHIP_ERROR_INCORRECT_STATE);
 
@@ -240,7 +238,7 @@ CHIP_ERROR ReadHandler::SendReportData(System::PacketBufferHandle && aPayload, b
     {
         VerifyOrReturnLogError(mpExchangeCtx == nullptr, CHIP_ERROR_INCORRECT_STATE);
         VerifyOrReturnLogError(mSessionHandle, CHIP_ERROR_INCORRECT_STATE);
-        mpExchangeCtx = mpExchangeMgr->NewContext(mSessionHandle.Get(), this);
+        mpExchangeCtx = InteractionModelEngine::GetInstance()->GetExchangeManager()->NewContext(mSessionHandle.Get(), this);
     }
 
     VerifyOrReturnLogError(mpExchangeCtx != nullptr, CHIP_ERROR_INCORRECT_STATE);
@@ -248,8 +246,15 @@ CHIP_ERROR ReadHandler::SendReportData(System::PacketBufferHandle && aPayload, b
     {
         mCurrentReportsBeginGeneration = InteractionModelEngine::GetInstance()->GetReportingEngine().GetDirtySetGeneration();
     }
-    mIsChunkedReport        = aMoreChunks;
-    bool noResponseExpected = IsType(InteractionType::Read) && !mIsChunkedReport;
+    if (aMoreChunks)
+    {
+        mFlags.Set(ReadHandlerFlags::ChunkedReport);
+    }
+    else
+    {
+        mFlags.Clear(ReadHandlerFlags::ChunkedReport);
+    }
+    bool noResponseExpected = IsType(InteractionType::Read) && !aMoreChunks;
     if (!noResponseExpected)
     {
         MoveToState(HandlerState::AwaitingReportResponse);
@@ -387,7 +392,12 @@ CHIP_ERROR ReadHandler::ProcessReadRequest(System::PacketBufferHandle && aPayloa
     // Ensure the read transaction doesn't exceed the resources dedicated to read transactions.
     VerifyOrReturnError(InteractionModelEngine::GetInstance()->CanEstablishReadTransaction(this), CHIP_ERROR_NO_MEMORY);
 
-    ReturnErrorOnFailure(readRequestParser.GetIsFabricFiltered(&mIsFabricFiltered));
+    bool isFabricFiltered;
+    ReturnErrorOnFailure(readRequestParser.GetIsFabricFiltered(&isFabricFiltered));
+    if (isFabricFiltered)
+    {
+        mFlags.Set(ReadHandlerFlags::FabricFiltered);
+    }
     ReturnErrorOnFailure(readRequestParser.ExitContainer());
     MoveToState(HandlerState::GeneratingReports);
 
@@ -642,7 +652,7 @@ void ReadHandler::MoveToState(const HandlerState aTargetState)
 
 bool ReadHandler::CheckEventClean(EventManagement & aEventManager)
 {
-    if (mIsChunkedReport)
+    if (mFlags.Has(ReadHandlerFlags::ChunkedReport))
     {
         if ((mLastScheduledEventNumber != 0) && (mEventMin <= mLastScheduledEventNumber))
         {
@@ -683,7 +693,7 @@ CHIP_ERROR ReadHandler::SendSubscribeResponse()
 
     ReturnErrorOnFailure(RefreshSubscribeSyncTimer());
 
-    mIsPrimingReports = false;
+    mFlags.Clear(ReadHandlerFlags::PrimingReports);
     return mpExchangeCtx->SendMessage(Protocols::InteractionModel::MsgType::SubscribeResponse, std::move(packet));
 }
 
@@ -762,7 +772,12 @@ CHIP_ERROR ReadHandler::ProcessSubscribeRequest(System::PacketBufferHandle && aP
     ChipLogProgress(DataManagement, "Final negotiated min/max parameters: Min = %ds, Max = %ds", mMinIntervalFloorSeconds,
                     mMaxIntervalCeilingSeconds);
 
-    ReturnErrorOnFailure(subscribeRequestParser.GetIsFabricFiltered(&mIsFabricFiltered));
+    bool isFabricFiltered;
+    ReturnErrorOnFailure(subscribeRequestParser.GetIsFabricFiltered(&isFabricFiltered));
+    if (isFabricFiltered)
+    {
+        mFlags.Set(ReadHandlerFlags::FabricFiltered);
+    }
     ReturnErrorOnFailure(Crypto::DRBG_get_bytes(reinterpret_cast<uint8_t *>(&mSubscriptionId), sizeof(mSubscriptionId)));
     ReturnErrorOnFailure(subscribeRequestParser.ExitContainer());
     MoveToState(HandlerState::GeneratingReports);
@@ -777,7 +792,7 @@ void ReadHandler::OnUnblockHoldReportCallback(System::Layer * apSystemLayer, voi
     VerifyOrReturn(apAppState != nullptr);
     ReadHandler * readHandler = static_cast<ReadHandler *>(apAppState);
     ChipLogDetail(DataManagement, "Unblock report hold after min %d seconds", readHandler->mMinIntervalFloorSeconds);
-    readHandler->mHoldReport = false;
+    readHandler->mFlags.Clear(ReadHandlerFlags::HoldReport);
     if (readHandler->IsDirty())
     {
         InteractionModelEngine::GetInstance()->GetReportingEngine().ScheduleRun();
@@ -791,7 +806,7 @@ void ReadHandler::OnRefreshSubscribeTimerSyncCallback(System::Layer * apSystemLa
 {
     VerifyOrReturn(apAppState != nullptr);
     ReadHandler * readHandler = static_cast<ReadHandler *>(apAppState);
-    readHandler->mHoldSync    = false;
+    readHandler->mFlags.Clear(ReadHandlerFlags::HoldSync);
     ChipLogDetail(DataManagement, "Refresh subscribe timer sync after %d seconds",
                   readHandler->mMaxIntervalCeilingSeconds - readHandler->mMinIntervalFloorSeconds);
     InteractionModelEngine::GetInstance()->GetReportingEngine().ScheduleRun();
@@ -804,8 +819,10 @@ CHIP_ERROR ReadHandler::RefreshSubscribeSyncTimer()
         OnUnblockHoldReportCallback, this);
     InteractionModelEngine::GetInstance()->GetExchangeManager()->GetSessionManager()->SystemLayer()->CancelTimer(
         OnRefreshSubscribeTimerSyncCallback, this);
-    mHoldReport = true;
-    mHoldSync   = true;
+
+    mFlags.Set(ReadHandlerFlags::HoldReport);
+    mFlags.Set(ReadHandlerFlags::HoldSync);
+
     ReturnErrorOnFailure(
         InteractionModelEngine::GetInstance()->GetExchangeManager()->GetSessionManager()->SystemLayer()->StartTimer(
             System::Clock::Seconds16(mMinIntervalFloorSeconds), OnUnblockHoldReportCallback, this));
@@ -847,6 +864,15 @@ void ReadHandler::SetDirty(const AttributePathParams & aAttributeChanged)
         mAttributePathExpandIterator.ResetCurrentCluster();
         mAttributeEncoderState = AttributeValueEncoder::AttributeEncodeState();
     }
+}
+
+Transport::SecureSession * ReadHandler::GetSession() const
+{
+    if (!mSessionHandle)
+    {
+        return nullptr;
+    }
+    return mSessionHandle->AsSecureSession();
 }
 } // namespace app
 } // namespace chip
